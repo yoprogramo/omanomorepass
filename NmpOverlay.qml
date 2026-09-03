@@ -51,7 +51,10 @@ Item {
   function open(payloadJson) {
     var payload = {}
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = {} }
-    root.site = typeof payload.site === "string" && payload.site ? payload.site : "omarchy"
+    // Default site carries a timestamp: the phone app shows the site when
+    // confirming the send, so a mismatch against the card label instantly
+    // reveals a scan of a stale QR.
+    root.site = typeof payload.site === "string" && payload.site ? payload.site : ("omarchy-" + Qt.formatDateTime(new Date(), "HHmmss"))
     root.timeoutSecs = typeof payload.timeout === "number" && payload.timeout > 0 ? payload.timeout : 90
     nlog("open (site=" + root.site + " timeout=" + root.timeoutSecs + "s)")
     root.state = "requesting"

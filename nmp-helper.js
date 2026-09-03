@@ -82,8 +82,9 @@ async function main() {
   }
 
   const token = newToken()
+  const ticketFp = data.ticket.substring(0, 6) + "…"
   send({ event: 'qr', text: 'nomorepass://' + token + data.ticket + opts.site })
-  log('ticket listo, sondeando cada 3s (timeout ' + opts.timeout + 's)')
+  log('ticket ' + ticketFp + ' listo (site=' + opts.site + '), sondeando cada 3s (timeout ' + opts.timeout + 's)')
 
   // 2. Sondeo de check.php: waiting → seguimos; grant → descifrar; deny/expired → fin.
   let attempt = 0
@@ -125,7 +126,7 @@ async function main() {
       send({ event: 'expired' })
       process.exit(0)
     } else {
-      log('intento ' + attempt + ': esperando escaneo…')
+      log('intento ' + attempt + ' [ticket ' + ticketFp + ']: esperando escaneo…')
       schedule()
     }
   }

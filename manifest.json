@@ -7,9 +7,17 @@
   "license": "MIT",
   "description": "Receive credentials from the NoMorePass mobile app via QR code and copy them to the clipboard.",
   "kinds": [
-    "overlay"
+    "overlay",
+    "bar-widget"
   ],
   "entryPoints": {
-    "overlay": "NmpOverlay.qml"
+    "overlay": "NmpOverlay.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "NoMorePass",
+    "description": "Receive a password from the NoMorePass app via QR",
+    "category": "Security",
+    "allowMultiple": false
   }
 }

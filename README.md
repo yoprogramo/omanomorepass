@@ -49,11 +49,29 @@ omarchy plugin enable io.github.yoprogramo.omanomorepass
 
 ## Usage
 
-Summon the overlay (for example from a Hyprland keybinding or the omarchy
-menu):
+Summon the overlay from a Hyprland keybinding, the bar widget, or the shell:
 
 ```sh
 omarchy-shell shell summon io.github.yoprogramo.omanomorepass '{"site":"github.com","timeout":90}'
+```
+
+### Bar widget
+
+The plugin ships a QR-code button for the Omarchy bar (kind `bar-widget`).
+Add it with:
+
+```sh
+omarchy bar put io.github.yoprogramo.omanomorepass --section right
+```
+
+Left click opens the overlay, click again closes it.
+
+### Keybinding example
+
+```lua
+-- ~/.config/hypr/bindings.lua
+o.bind("SUPER + ALT + P", "NoMorePass",
+  "omarchy-shell shell toggle io.github.yoprogramo.omanomorepass '{}'")
 ```
 
 Both payload keys are optional. Scan the QR with the NoMorePass app and

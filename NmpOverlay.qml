@@ -84,7 +84,11 @@ Item {
 
   // Node is resolved from PATH at spawn time, with well-known fallback
   // locations, so the plugin is not tied to one machine's install layout.
+  // Stop first, then reassign: reassigning command on a running process is
+  // a no-op on some Quickshell builds, which would keep serving the first
+  // ticket forever.
   function startHelper() {
+    helperProc.running = false
     helperProc.command = [
       "bash", "-c",
       'NODE="$(command -v node || command -v nodejs)"; ' +

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.yoprogramo.omanomorepass",
+  "name": "NoMorePass",
+  "version": "1.0.0",
+  "author": "yoprogramo",
+  "license": "MIT",
+  "description": "Receive credentials from the NoMorePass mobile app via QR code and copy them to the clipboard.",
+  "kinds": [
+    "overlay"
+  ],
+  "entryPoints": {
+    "overlay": "NmpOverlay.qml"
+  }
+}

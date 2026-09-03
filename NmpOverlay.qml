@@ -16,7 +16,10 @@ Item {
   id: root
 
   readonly property string helperPath: Qt.resolvedUrl("nmp-helper.js").toString().replace("file://", "")
-  readonly property string qrPngPath: "/tmp/omanomorepass-qr.png"
+  // One file per ticket: a fixed path would hit QML's image cache, which
+  // serves the first decode forever for an unchanged URL — the second open
+  // would paint the previous (already consumed) QR.
+  property string qrPngPath: ""
 
   property bool opened: false
   property string site: "omarchy"
@@ -105,6 +108,8 @@ Item {
       break
     case "qr":
       root.statusMessage = "Waiting for scan…"
+      root.qrPngPath = "/tmp/omanomorepass-qr-" + Date.now() + ".png"
+      root.qrImageSource = ""
       qrEncProc.command = ["qrencode", "-o", root.qrPngPath, "-t", "PNG", "-s", "10", "-m", "2", ev.text]
       qrEncProc.running = true
       break
@@ -218,7 +223,7 @@ Item {
 
   Process {
     id: cleanupPng
-    command: ["rm", "-f", root.qrPngPath]
+    command: ["bash", "-c", "rm -f /tmp/omanomorepass-qr-*.png"]
   }
 
   Process {
@@ -326,6 +331,7 @@ Item {
               anchors.fill: parent
               anchors.margins: Style.space(10)
               source: root.qrImageSource
+              cache: false
               fillMode: Image.PreserveAspectFit
               smooth: true
               asynchronous: true

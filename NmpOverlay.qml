@@ -16,10 +16,6 @@ Item {
   id: root
 
   readonly property string helperPath: Qt.resolvedUrl("nmp-helper.js").toString().replace("file://", "")
-  // One file per ticket: a fixed path would hit QML's image cache, which
-  // serves the first decode forever for an unchanged URL — the second open
-  // would paint the previous (already consumed) QR.
-  property string qrPngPath: ""
 
   property bool opened: false
   property string site: "omarchy"
@@ -74,7 +70,7 @@ Item {
     root.state = "idle"
     helperProc.running = false
     qrEncProc.running = false
-    cleanupPng.running = true
+    root.qrImageSource = ""
   }
 
   function toggle() {
@@ -112,9 +108,12 @@ Item {
       break
     case "qr":
       root.statusMessage = "Waiting for scan…"
-      root.qrPngPath = "/tmp/omanomorepass-qr-" + Date.now() + ".png"
       root.qrImageSource = ""
-      qrEncProc.command = ["qrencode", "-o", root.qrPngPath, "-t", "PNG", "-s", "10", "-m", "2", ev.text]
+      qrEncProc.running = false
+      // Keep the PNG in memory: no shared temporary paths or symlinks.
+      qrEncProc.command = ["bash", "-o", "pipefail", "-c",
+        'qrencode -o - -t PNG -s 10 -m 2 "$1" | base64 -w 0; result=$?; printf "\\n"; exit "$result"',
+        "nmp-qr", ev.text]
       qrEncProc.running = true
       break
     case "credentials":
@@ -213,9 +212,15 @@ Item {
 
   Process {
     id: qrEncProc
+    stdout: SplitParser {
+      onRead: function(data) {
+        if (root.opened && root.state === "requesting" && data)
+          root.qrImageSource = "data:image/png;base64," + data
+      }
+    }
     onExited: function(exitCode, exitStatus) {
-      if (exitCode === 0) {
-        root.qrImageSource = "file://" + root.qrPngPath
+      if (!root.opened || root.state !== "requesting") return
+      if (exitCode === 0 && root.qrImageSource !== "") {
         root.state = "waiting"
       } else {
         nlog("qrencode failed code=" + exitCode)
@@ -223,11 +228,6 @@ Item {
         root.statusMessage = "Could not render the QR code."
       }
     }
-  }
-
-  Process {
-    id: cleanupPng
-    command: ["bash", "-c", "rm -f /tmp/omanomorepass-qr-*.png"]
   }
 
   Process {

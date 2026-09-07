@@ -21,6 +21,7 @@
 
 'use strict'
 
+const { randomInt } = require('crypto')
 const axios = require('axios')
 const FormData = require('form-data')
 const CryptoJS = require('crypto-js')
@@ -42,36 +43,55 @@ function parseArgs(argv) {
     else if (argv[i] === '--timeout') opts.timeout = parseInt(argv[++i], 10) || 90
     else if (argv[i] === '--apikey') opts.apikey = argv[++i]
   }
+  if (opts.timeout <= 0 || opts.timeout > 2147483) opts.timeout = 90
   if (process.env.NMP_SITE) opts.site = process.env.NMP_SITE
   return opts
 }
 
 // Token de 12 caracteres alfanuméricos, igual que nmp_newtoken() de la lib:
-// es la passphrase con la que la app cifra la contraseña para este envío.
+// ~71 bits de entropía, sin sesgo y con el formato fijo del protocolo.
+// Es la passphrase con la que la app cifra la contraseña para este envío.
 function newToken() {
   const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
   let out = ''
-  for (let i = 0; i < 12; i++) out += charset.charAt(Math.floor(Math.random() * charset.length))
+  for (let i = 0; i < 12; i++) out += charset.charAt(randomInt(charset.length))
   return out
 }
 
-async function post(path, params, apikey) {
+async function post(path, params, apikey, cancelToken) {
   const fd = new FormData()
   for (const name in params) fd.append(name, params[name])
   const headers = fd.getHeaders()
   headers.apikey = apikey || 'FREEAPIKEY'
-  const res = await axios.post(API + path, fd, { headers })
+  const res = await axios.post(API + path, fd, {
+    headers,
+    timeout: 10000,
+    maxContentLength: 1024 * 1024,
+    maxBodyLength: 64 * 1024,
+    maxRedirects: 3,
+    cancelToken
+  })
   return res.data
 }
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2))
+  // Cubre también getid.php y cancela cualquier petición en curso.
+  const cancellation = axios.CancelToken.source()
+  let stopped = false
+  setTimeout(() => {
+    stopped = true
+    cancellation.cancel('Tiempo de espera agotado')
+    log('tiempo de espera agotado sin escaneo')
+    send({ event: 'timeout' })
+    process.exit(0)
+  }, opts.timeout * 1000)
   send({ event: 'status', state: 'requesting' })
 
   // 1. Ticket para este envío.
   let data
   try {
-    data = await post('/getid.php', { site: opts.site }, opts.apikey)
+    data = await post('/getid.php', { site: opts.site }, opts.apikey, cancellation.token)
   } catch (e) {
     send({ event: 'error', message: 'Sin conexión con api.nomorepass.com (' + e.message + ')' })
     process.exit(1)
@@ -88,14 +108,13 @@ async function main() {
 
   // 2. Sondeo de check.php: waiting → seguimos; grant → descifrar; deny/expired → fin.
   let attempt = 0
-  let stopped = false
   const schedule = () => { if (!stopped) setTimeout(poll, 3000) }
 
   const poll = async () => {
     attempt++
     let resp
     try {
-      resp = await post('/check.php', { ticket: data.ticket }, opts.apikey)
+      resp = await post('/check.php', { ticket: data.ticket }, opts.apikey, cancellation.token)
     } catch (e) {
       log('intento ' + attempt + ': error de red (' + e.message + ')')
       schedule()
@@ -131,17 +150,11 @@ async function main() {
     }
   }
   schedule()
-
-  // 3. Timeout global.
-  setTimeout(() => {
-    stopped = true
-    log('tiempo de espera agotado sin escaneo')
-    send({ event: 'timeout' })
-    process.exit(0)
-  }, opts.timeout * 1000)
 }
 
-main().catch((e) => {
+if (require.main === module) main().catch((e) => {
   send({ event: 'error', message: String(e && e.message ? e.message : e) })
   process.exit(1)
 })
+
+module.exports = { newToken, post, parseArgs, main }

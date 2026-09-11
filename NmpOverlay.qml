@@ -4,6 +4,7 @@ import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
+import "protocol.js" as Protocol
 
 // NoMorePass overlay: requests a ticket from api.nomorepass.com, shows the
 // QR code rendered by qrencode and, once the mobile app approves the send,
@@ -20,11 +21,14 @@ Item {
   property bool opened: false
   property string site: "omarchy"
   property int timeoutSecs: 90
-  // idle | requesting | waiting | success | error
+  // idle | requesting | waiting | copying | success | error
   property string state: "idle"
   property string statusMessage: ""
   property string successUser: ""
   property string qrImageSource: ""
+  property string pendingSecret: ""
+  property var eventStream: null
+  property var diagnosticStream: null
 
   property color background: Color.menu.background
   property color foreground: Color.menu.text
@@ -44,18 +48,35 @@ Item {
   // Messages are redacted before they get here: never the password.
   readonly property string logSh: Qt.resolvedUrl("log.sh").toString().replace("file://", "")
   function nlog(msg) {
-    Quickshell.execDetached([root.logSh, String(msg)])
+    Quickshell.execDetached({
+      command: ["/usr/bin/bash", "-p", root.logSh, String(msg)],
+      clearEnvironment: true,
+      environment: { "HOME": Quickshell.env("HOME"), "LANG": "C.UTF-8" }
+    })
   }
 
   function open(payloadJson) {
+    root.close()
     var payload = {}
-    try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = {} }
+    try {
+      if (!Protocol.boundedString(payloadJson || "{}", 2048, true)) throw new Error("Invalid payload")
+      payload = JSON.parse(payloadJson || "{}")
+      if (!Protocol.schema(payload, [], ["site", "timeout"])) throw new Error("Invalid payload")
+      if (payload.site !== undefined && (!Protocol.boundedString(payload.site, Protocol.limits.site, true)
+          || /[\u0000-\u001f\u007f]/.test(payload.site))) throw new Error("Invalid site")
+      if (payload.timeout !== undefined && (typeof payload.timeout !== "number"
+          || !isFinite(payload.timeout) || payload.timeout < 1 || payload.timeout > 900)) throw new Error("Invalid timeout")
+    } catch (e) {
+      root.opened = true
+      root.fail("Invalid input: site is limited to 256 UTF-8 bytes; timeout to 1–900 seconds.")
+      return
+    }
     // Default site carries a timestamp: the phone app shows the site when
     // confirming the send, so a mismatch against the card label instantly
     // reveals a scan of a stale QR.
     root.site = typeof payload.site === "string" && payload.site ? payload.site : ("omarchy-" + Qt.formatDateTime(new Date(), "HHmmss"))
     root.timeoutSecs = typeof payload.timeout === "number" && payload.timeout > 0 ? payload.timeout : 90
-    nlog("open (site=" + root.site + " timeout=" + root.timeoutSecs + "s)")
+    nlog("open")
     root.state = "requesting"
     root.statusMessage = "Requesting ticket from nomorepass…"
     root.successUser = ""
@@ -69,7 +90,14 @@ Item {
     root.opened = false
     root.state = "idle"
     helperProc.running = false
-    qrEncProc.running = false
+    copyProc.running = false
+    copyProc.stdinEnabled = false
+    root.pendingSecret = ""
+    root.successUser = ""
+    if (root.eventStream) root.eventStream.fail()
+    if (root.diagnosticStream) root.diagnosticStream.fail()
+    autoCloseTimer.stop()
+    copyDeadline.stop()
     root.qrImageSource = ""
   }
 
@@ -78,82 +106,88 @@ Item {
     else root.open("{}")
   }
 
-  // Node is resolved from PATH at spawn time, with well-known fallback
-  // locations, so the plugin is not tied to one machine's install layout.
-  // Stop first, then reassign: reassigning command on a running process is
-  // a no-op on some Quickshell builds, which would keep serving the first
-  // ticket forever.
-  function startHelper() {
+  function fail(message) {
+    root.state = "error"
+    root.statusMessage = message
     helperProc.running = false
+    copyProc.running = false
+    copyProc.stdinEnabled = false
+    root.pendingSecret = ""
+    root.qrImageSource = ""
+    if (root.eventStream) root.eventStream.fail()
+    if (root.diagnosticStream) root.diagnosticStream.fail()
+    copyDeadline.stop()
+  }
+
+  // Fixed system binaries and an allowlisted environment: no PATH or runtime hooks.
+  function startHelper() {
+    if (!root.opened || root.state !== "requesting") return
+    helperProc.running = false
+    root.eventStream = Protocol.lineStream(Protocol.limits.line, Protocol.limits.output, Protocol.limits.events)
+    root.diagnosticStream = Protocol.lineStream(Protocol.limits.stderrLine, Protocol.limits.stderrOutput, 310)
     helperProc.command = [
-      "bash", "-c",
-      'NODE="$(command -v node || command -v nodejs)"; ' +
-      'if [ -z "$NODE" ]; then ' +
-      'for c in "$HOME/.local/share/mise/shims/node" "$HOME"/.nvm/versions/node/*/bin/node /usr/local/bin/node /usr/bin/node /usr/bin/nodejs; do ' +
-      '[ -x "$c" ] && NODE="$c" && break; done; fi; ' +
-      '[ -n "$NODE" ] || { echo "Node.js not found. Install Node.js to use this plugin." >&2; exit 127; }; ' +
-      'exec "$NODE" "$@"',
-      "nmp-helper",
+      "/usr/bin/node",
       root.helperPath, "--site", root.site, "--timeout", String(root.timeoutSecs)
     ]
     helperProc.running = true
   }
 
   function handleEvent(ev) {
-    if (!ev || !ev.event) return
-    // Redacted log line: never the password.
-    nlog("event=" + ev.event + (ev.event === "credentials" ? " (credentials received)" : (ev.message ? " msg=" + ev.message : "")))
+    if (!root.opened) return
+    if (root.state === "copying") { root.fail("Unexpected event after credentials."); return }
+    if (!root.busy) return
+    if (!Protocol.validEvent(ev)) { root.fail("Invalid helper event."); return }
+    nlog("event=" + ev.event)
     switch (ev.event) {
     case "status":
       break
     case "qr":
+      if (root.state !== "requesting") { root.fail("Unexpected QR event."); return }
       root.statusMessage = "Waiting for scan…"
-      root.qrImageSource = ""
-      qrEncProc.running = false
-      // Keep the PNG in memory: no shared temporary paths or symlinks.
-      qrEncProc.command = ["bash", "-o", "pipefail", "-c",
-        'qrencode -o - -t PNG -s 10 -m 2 "$1" | base64 -w 0; result=$?; printf "\\n"; exit "$result"',
-        "nmp-qr", ev.text]
-      qrEncProc.running = true
+      root.qrImageSource = "data:image/png;base64," + ev.image
+      root.state = "waiting"
       break
     case "credentials":
+      if (root.state !== "waiting") { root.fail("Unexpected credential event."); return }
       root.copyCredential(ev)
       break
     case "denied":
-      root.state = "error"
-      root.statusMessage = "The send was rejected from the phone."
+      root.fail("The send was rejected from the phone.")
       break
     case "expired":
-      root.state = "error"
-      root.statusMessage = "The ticket expired. Please try again."
+      root.fail("The ticket expired. Please try again.")
       break
     case "timeout":
-      root.state = "error"
-      root.statusMessage = "Timed out waiting for a scan."
+      root.fail("Timed out waiting for a scan.")
       break
     case "error":
-      root.state = "error"
-      root.statusMessage = ev.message || "Unknown error in the NoMorePass protocol."
+      root.fail(ev.message)
       break
     }
   }
 
   function copyCredential(ev) {
-    var secret = ev.password || ""
-    if (!secret && ev.user) secret = ev.user
+    if (!Protocol.boundedString(ev.password, Protocol.limits.password, false)
+        || !Protocol.boundedString(ev.user, Protocol.limits.user, false) || copyProc.running) {
+      ev.password = ""
+      root.fail("Invalid credential or clipboard operation already running.")
+      return
+    }
+    var secret = ev.password || ev.user
+    ev.password = ""
     if (!secret) {
-      root.state = "error"
-      root.statusMessage = "The received credential is empty."
+      root.fail("The received credential is empty.")
       return
     }
     root.successUser = ev.user || ""
-    // wl-copy inherits WAYLAND_DISPLAY; the secret travels through the
-    // environment (never argv) and bash pipes it into wl-copy's stdin.
-    copyProc.environment = ({ "NMP_SECRET": secret })
+    root.pendingSecret = secret
+    secret = ""
+    root.qrImageSource = ""
+    root.state = "copying"
+    root.statusMessage = "Copying to clipboard…"
+    copyProc.stdinEnabled = true
+    copyDeadline.restart()
     copyProc.running = true
-    root.state = "success"
-    root.statusMessage = "Copied to clipboard"
-    autoCloseTimer.restart()
   }
 
   // Tests the whole credential→clipboard path without a phone:
@@ -174,9 +208,15 @@ Item {
   }
 
   Timer {
+    id: copyDeadline
+    interval: 5000
+    onTriggered: root.fail("Clipboard operation timed out.")
+  }
+
+  Timer {
     id: spinnerTimer
     interval: 80
-    running: root.busy
+    running: root.busy || root.state === "copying"
     repeat: true
     onTriggered: root.spinnerIndex = (root.spinnerIndex + 1) % root.spinnerFrames.length
   }
@@ -189,53 +229,69 @@ Item {
 
   Process {
     id: helperProc
+    clearEnvironment: true
+    environment: ({ "LANG": "C.UTF-8", "NMP_APIKEY": null })
     stdout: SplitParser {
+      splitMarker: ""
       onRead: function(data) {
-        try { root.handleEvent(JSON.parse(data)) } catch (e) {
-          root.nlog("non-JSON stdout from helper: " + data)
+        if (!root.opened || (!root.busy && root.state !== "copying")) return
+        if (!root.eventStream.push(data, function(line) {
+          try { root.handleEvent(JSON.parse(line)) } catch (e) { root.fail("Invalid helper output.") }
+        }) && (root.busy || root.state === "copying")) {
+          root.fail("Helper output exceeded its limit.")
         }
       }
     }
     stderr: SplitParser {
+      splitMarker: ""
       onRead: function(data) {
-        root.nlog("helper-stderr: " + data)
+        if (!root.opened || (!root.busy && root.state !== "copying")) return
+        // Never forward raw subprocess diagnostics; they may contain secrets.
+        if (!root.diagnosticStream.push(data, function(line) {})) root.fail("Helper diagnostics exceeded their limit.")
       }
+    }
+    onRunningChanged: {
+      if (!running && root.busy) root.fail("NoMorePass helper stopped; /usr/bin/node and /usr/bin/qrencode are required.")
     }
     onExited: function(exitCode, exitStatus) {
       nlog("helper exited code=" + exitCode)
-      if (exitCode === 127 && root.state === "requesting") {
-        root.state = "error"
-        root.statusMessage = "Node.js was not found. Install Node.js to use this plugin."
+      if (root.state === "copying" && (exitCode !== 0 || exitStatus !== 0 || !root.eventStream.finish())) {
+        root.fail("Incomplete helper output.")
+        return
       }
-    }
-  }
-
-  Process {
-    id: qrEncProc
-    stdout: SplitParser {
-      onRead: function(data) {
-        if (root.opened && root.state === "requesting" && data)
-          root.qrImageSource = "data:image/png;base64," + data
-      }
-    }
-    onExited: function(exitCode, exitStatus) {
-      if (!root.opened || root.state !== "requesting") return
-      if (exitCode === 0 && root.qrImageSource !== "") {
-        root.state = "waiting"
-      } else {
-        nlog("qrencode failed code=" + exitCode)
-        root.state = "error"
-        root.statusMessage = "Could not render the QR code."
-      }
+      if (root.busy) root.fail("NoMorePass helper ended before completing the transfer.")
     }
   }
 
   Process {
     id: copyProc
-    command: ["bash", "-c", "printf '%s' \"$NMP_SECRET\" | wl-copy"]
-    onStarted: nlog("wl-copy started pid=" + processId)
+    command: ["/usr/bin/wl-copy"]
+    clearEnvironment: true
+    environment: ({ "WAYLAND_DISPLAY": null, "XDG_RUNTIME_DIR": null, "LANG": "C.UTF-8" })
+    onStarted: {
+      try { copyProc.write(root.pendingSecret) }
+      finally {
+        copyProc.stdinEnabled = false
+        root.pendingSecret = ""
+      }
+    }
+    onRunningChanged: {
+      if (!running) {
+        root.pendingSecret = ""
+        copyProc.stdinEnabled = false
+        // Failed starts do not emit exited. Defer to let a normal exit report first.
+        Qt.callLater(function() { if (root.state === "copying") root.fail("Could not start /usr/bin/wl-copy.") })
+      }
+    }
     onExited: function(exitCode, exitStatus) {
+      root.pendingSecret = ""
+      copyDeadline.stop()
       nlog("wl-copy exited code=" + exitCode)
+      if (root.state !== "copying") return
+      if (exitCode !== 0 || exitStatus !== 0) { root.fail("Could not copy the credential."); return }
+      root.state = "success"
+      root.statusMessage = "Copied to clipboard"
+      autoCloseTimer.restart()
     }
   }
 
@@ -346,7 +402,7 @@ Item {
           Column {
             anchors.centerIn: parent
             spacing: Style.space(12)
-            visible: root.state === "requesting"
+            visible: root.state === "requesting" || root.state === "copying"
 
             Text {
               width: parent.width

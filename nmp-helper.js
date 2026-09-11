@@ -8,8 +8,8 @@
 //
 // Protocolo en stdout (un JSON por línea):
 //   {"event":"status","state":"requesting"}
-//   {"event":"qr","text":"nomorepass://<token><ticket><site>"}
-//   {"event":"credentials","user":"...","password":"...","extra":"..."}
+//   {"event":"qr","image":"<bounded base64 PNG>"}
+//   {"event":"credentials","user":"...","password":"..."}
 //   {"event":"denied"} | {"event":"expired"} | {"event":"timeout"}
 //   {"event":"error","message":"..."}
 //
@@ -22,14 +22,27 @@
 'use strict'
 
 const { randomInt } = require('crypto')
+const { spawnSync } = require('node:child_process')
+const { limits, boundedString, schema, validEvent } = require('./protocol')
 const axios = require('axios')
 const FormData = require('form-data')
 const CryptoJS = require('crypto-js')
 
 const API = 'https://api.nomorepass.com/api'
 
-function send(obj) {
-  process.stdout.write(JSON.stringify(obj) + '\n')
+function send(obj, done) {
+  if (!validEvent(obj)) throw new Error('Invalid helper event')
+  // ASCII framing also keeps arbitrary pipe chunk boundaries UTF-8 safe.
+  const line = JSON.stringify(obj).replace(/[\u007f-\uffff]/g,
+    ch => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0'))
+  if (line.length > limits.line) throw new Error('Helper output overflow')
+  process.stdout.write(line + '\n', done)
+}
+
+// Drain the final event before exiting: JSON escaping can expand a bounded
+// credential beyond the pipe's capacity.
+function finish(obj, code = 0) {
+  send(obj, () => process.exit(code))
 }
 
 function log(msg) {
@@ -45,7 +58,55 @@ function parseArgs(argv) {
   }
   if (opts.timeout <= 0 || opts.timeout > 2147483) opts.timeout = 90
   if (process.env.NMP_SITE) opts.site = process.env.NMP_SITE
+  if (!boundedString(opts.site, limits.site, true) || /[\u0000-\u001f\u007f]/.test(opts.site))
+    throw new Error('Invalid site (maximum 256 UTF-8 bytes)')
+  if (!boundedString(opts.apikey, 256, false) || /[\r\n\0]/.test(opts.apikey))
+    throw new Error('Invalid API key')
+  if (opts.timeout > 900) opts.timeout = 900
   return opts
+}
+
+function validateTicket(data) {
+  if (!schema(data, ['resultado', 'ticket'], []) || data.resultado !== 'ok'
+      || !boundedString(data.ticket, limits.ticket, true) || !/^[A-Za-z0-9_-]+$/.test(data.ticket))
+    throw new Error('Invalid ticket response')
+  return data.ticket
+}
+
+function validatePoll(data) {
+  if (!schema(data, ['resultado', 'grant'], ['usuario', 'password', 'extra'])
+      || data.resultado !== 'ok' || !['waiting', 'grant', 'deny', 'expired'].includes(data.grant))
+    throw new Error('Invalid polling response')
+  for (const [key, max] of [['usuario', limits.user], ['password', limits.encrypted], ['extra', limits.extra]]) {
+    if (Object.prototype.hasOwnProperty.call(data, key) && !boundedString(data[key], max, false))
+      throw new Error('Invalid credential field')
+  }
+  if (data.grant === 'grant') {
+    if (!boundedString(data.usuario, limits.user, false)
+        || !boundedString(data.password, limits.encrypted, true)
+        || !/^[A-Za-z0-9+/]+={0,2}$/.test(data.password) || data.password.length % 4 !== 0)
+      throw new Error('Invalid encrypted credential')
+    const encrypted = Buffer.from(data.password, 'base64')
+    if (encrypted.toString('base64') !== data.password || encrypted.length < 32
+        || encrypted.length > 4128 || encrypted.length % 16 !== 0
+        || encrypted.subarray(0, 8).toString('ascii') !== 'Salted__')
+      throw new Error('Invalid encrypted credential')
+  }
+  return data
+}
+
+function renderQr(text) {
+  if (!boundedString(text, limits.qr, true) || !text.startsWith('nomorepass://') || text.includes('\0'))
+    throw new Error('Invalid QR payload')
+  // No shell, PATH lookup, argv payload, environment payload, or temporary file.
+  const result = spawnSync('/usr/bin/qrencode', ['-o', '-', '-t', 'PNG', '-s', '10', '-m', '2'], {
+    input: Buffer.from(text, 'utf8'), env: { LANG: 'C.UTF-8' },
+    timeout: 3000, killSignal: 'SIGKILL', maxBuffer: limits.png
+  })
+  if (result.error || result.status !== 0 || !result.stdout || result.stdout.length > limits.png
+      || result.stdout.subarray(0, 8).toString('hex') !== '89504e470d0a1a0a')
+    throw new Error('Could not render the QR code (/usr/bin/qrencode required)')
+  return result.stdout.toString('base64')
 }
 
 // Token de 12 caracteres alfanuméricos, igual que nmp_newtoken() de la lib:
@@ -66,7 +127,7 @@ async function post(path, params, apikey, cancelToken) {
   const res = await axios.post(API + path, fd, {
     headers,
     timeout: 10000,
-    maxContentLength: 1024 * 1024,
+    maxContentLength: limits.response,
     maxBodyLength: 64 * 1024,
     maxRedirects: 3,
     cancelToken
@@ -82,9 +143,8 @@ async function main() {
   setTimeout(() => {
     stopped = true
     cancellation.cancel('Tiempo de espera agotado')
-    log('tiempo de espera agotado sin escaneo')
-    send({ event: 'timeout' })
-    process.exit(0)
+    log('scan timed out')
+    finish({ event: 'timeout' })
   }, opts.timeout * 1000)
   send({ event: 'status', state: 'requesting' })
 
@@ -93,18 +153,16 @@ async function main() {
   try {
     data = await post('/getid.php', { site: opts.site }, opts.apikey, cancellation.token)
   } catch (e) {
-    send({ event: 'error', message: 'Sin conexión con api.nomorepass.com (' + e.message + ')' })
-    process.exit(1)
+    return finish({ event: 'error', message: 'Could not request a ticket from api.nomorepass.com' }, 1)
   }
-  if (!data || data.resultado !== 'ok' || !data.ticket) {
-    send({ event: 'error', message: 'getid: ' + JSON.stringify(data).slice(0, 200) })
-    process.exit(1)
+  let ticket
+  try { ticket = validateTicket(data) } catch (e) {
+    return finish({ event: 'error', message: 'Invalid ticket response' }, 1)
   }
 
   const token = newToken()
-  const ticketFp = data.ticket.substring(0, 6) + "…"
-  send({ event: 'qr', text: 'nomorepass://' + token + data.ticket + opts.site })
-  log('ticket ' + ticketFp + ' listo (site=' + opts.site + '), sondeando cada 3s (timeout ' + opts.timeout + 's)')
+  send({ event: 'qr', image: renderQr('nomorepass://' + token + ticket + opts.site) })
+  log('ticket ready; polling every 3s')
 
   // 2. Sondeo de check.php: waiting → seguimos; grant → descifrar; deny/expired → fin.
   let attempt = 0
@@ -114,38 +172,39 @@ async function main() {
     attempt++
     let resp
     try {
-      resp = await post('/check.php', { ticket: data.ticket }, opts.apikey, cancellation.token)
+      resp = await post('/check.php', { ticket }, opts.apikey, cancellation.token)
     } catch (e) {
-      log('intento ' + attempt + ': error de red (' + e.message + ')')
+      if (e.code === 'ERR_BAD_RESPONSE' || /maxContentLength/.test(e.message || '')) {
+        return finish({ event: 'error', message: 'Invalid or oversized API response' }, 1)
+      }
+      log('attempt ' + attempt + ': network error')
       schedule()
       return
     }
-    if (!resp || resp.resultado !== 'ok') {
-      log('intento ' + attempt + ': respuesta anómala ' + JSON.stringify(resp).slice(0, 120))
-      schedule()
-      return
+    try { validatePoll(resp) } catch (e) {
+      return finish({ event: 'error', message: 'Invalid polling response' }, 1)
     }
     const grant = resp.grant
     if (grant === 'grant') {
-      log('intento ' + attempt + ': credenciales recibidas ✓')
+      log('attempt ' + attempt + ': credentials received')
       let pass = ''
       try {
         pass = CryptoJS.AES.decrypt(resp.password, token).toString(CryptoJS.enc.Utf8)
+        if (!boundedString(pass, limits.password, false)) throw new Error('Credential overflow')
       } catch (e) {
-        log('aviso: descifrado vacío (' + e + ')')
+        return finish({ event: 'error', message: 'Could not decrypt the credential' }, 1)
       }
-      send({ event: 'credentials', user: resp.usuario || '', password: pass, extra: resp.extra || '' })
-      process.exit(0)
+      finish({ event: 'credentials', user: resp.usuario, password: pass })
+      pass = ''
+      resp.password = ''
     } else if (grant === 'deny') {
-      log('intento ' + attempt + ': envío rechazado desde el móvil')
-      send({ event: 'denied' })
-      process.exit(0)
+      log('attempt ' + attempt + ': denied')
+      finish({ event: 'denied' })
     } else if (grant === 'expired') {
-      log('intento ' + attempt + ': el ticket ha expirado en el servidor')
-      send({ event: 'expired' })
-      process.exit(0)
+      log('attempt ' + attempt + ': expired')
+      finish({ event: 'expired' })
     } else {
-      log('intento ' + attempt + ' [ticket ' + ticketFp + ']: esperando escaneo…')
+      log('attempt ' + attempt + ': waiting')
       schedule()
     }
   }
@@ -153,8 +212,7 @@ async function main() {
 }
 
 if (require.main === module) main().catch((e) => {
-  send({ event: 'error', message: String(e && e.message ? e.message : e) })
-  process.exit(1)
+  finish({ event: 'error', message: 'NoMorePass helper failed; check system dependencies and input limits' }, 1)
 })
 
-module.exports = { newToken, post, parseArgs, main }
+module.exports = { newToken, post, parseArgs, main, validateTicket, validatePoll, renderQr, send, finish }

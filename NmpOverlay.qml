@@ -44,12 +44,14 @@ Item {
   property int spinnerIndex: 0
   readonly property bool busy: state === "requesting" || state === "waiting"
 
-  // console.log from user plugins does not reach journald; this logger does.
-  // Messages are redacted before they get here: never the password.
-  readonly property string logSh: Qt.resolvedUrl("log.sh").toString().replace("file://", "")
+  // console.log from user plugins does not reach journald; log.js appends to a
+  // private, owner-only state log instead. Messages are redacted before they
+  // get here: never the password. The logger fails closed if the state path is
+  // a symlink or is not owned by the user, so it cannot be redirected.
+  readonly property string logJs: Qt.resolvedUrl("log.js").toString().replace("file://", "")
   function nlog(msg) {
     Quickshell.execDetached({
-      command: ["/usr/bin/bash", "-p", root.logSh, String(msg)],
+      command: ["/usr/bin/node", root.logJs, String(msg)],
       clearEnvironment: true,
       environment: { "HOME": Quickshell.env("HOME"), "LANG": "C.UTF-8" }
     })

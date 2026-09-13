@@ -113,6 +113,13 @@ Event names and process exit codes are logged to:
 ~/.local/state/omarchy/nomorepass.log
 ```
 
+`log.js` writes it: the `omarchy` state directory is created private (mode
+`0700`), must be owned by the current user and without any symlinked path
+component, and the log file is opened with `O_NOFOLLOW` and mode `0600`. If the
+state path is a pre-existing symlink or is not owned by the user, the logger
+writes nothing and exits — this is only diagnostic output, so it fails closed
+instead of following the link or blocking the transfer.
+
 If a transfer fails, check the error shown by the overlay and the event
 sequence in that file. `event=expired` means the ticket aged out;
 `wl-copy exited code=0` confirms the clipboard write. Raw helper output,
@@ -135,7 +142,9 @@ you.
   cleared after writing or on failure/cancellation. JavaScript and Qt do not
   guarantee secure memory erasure; this does not protect against a process
   allowed to inspect application memory or the clipboard.
-- Diagnostics logs are redacted.
+- Diagnostics logs are redacted and cannot be redirected through a symlink:
+  the state directory is owner-checked and non-symbolic, and the log is opened
+  with `O_NOFOLLOW`.
 - The plugin runs unsandboxed inside `omarchy-shell`, like every Omarchy
   plugin. Review the code before enabling it.
 

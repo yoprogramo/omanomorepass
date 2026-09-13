@@ -257,3 +257,57 @@ test('clipboard uses direct stdin and clears retained secrets', () => {
   assert.ok(root.error)
   assert.equal(copyProc.running, false)
 })
+
+test('diagnostic logger writes privately and refuses symlinked state paths', () => {
+  const { spawnSync } = require('node:child_process')
+  const os = require('node:os')
+  const path = require('node:path')
+  const logJs = require.resolve('../log')
+  const run = home => spawnSync(process.execPath, [logJs, 'open'], {
+    env: home === undefined ? { LANG: 'C.UTF-8' } : { HOME: home, LANG: 'C.UTF-8' },
+    encoding: 'utf8'
+  })
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nmp-log-'))
+  const home = path.join(tmp, 'home')
+  fs.mkdirSync(home, { mode: 0o700 })
+
+  // Camino normal: crea el directorio privado 0700 y el log 0600.
+  assert.equal(run(home).status, 0)
+  const dir = path.join(home, '.local', 'state', 'omarchy')
+  const log = path.join(dir, 'nomorepass.log')
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700)
+  assert.equal(fs.statSync(log).mode & 0o777, 0o600)
+  assert.match(fs.readFileSync(log, 'utf8'),
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} open\n$/)
+
+  // Un log preexistente como enlace simbólico no se sigue.
+  const victim = path.join(tmp, 'victim')
+  fs.writeFileSync(victim, 'SENTINEL\n')
+  fs.unlinkSync(log)
+  fs.symlinkSync(victim, log)
+  assert.equal(run(home).status, 1)
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'SENTINEL\n')
+
+  // Un componente del directorio como enlace simbólico tampoco se sigue.
+  const home2 = path.join(tmp, 'home2')
+  fs.mkdirSync(path.join(home2, '.local', 'state'), { recursive: true, mode: 0o700 })
+  const elsewhere = path.join(tmp, 'elsewhere')
+  fs.mkdirSync(elsewhere, { mode: 0o700 })
+  fs.symlinkSync(elsewhere, path.join(home2, '.local', 'state', 'omarchy'))
+  assert.equal(run(home2).status, 1)
+  assert.equal(fs.existsSync(path.join(elsewhere, 'nomorepass.log')), false)
+
+  // HOME ausente y mensajes con saltos de línea se rechazan.
+  assert.equal(run(undefined).status, 1)
+  assert.equal(spawnSync(process.execPath, [logJs, 'a\nb'], {
+    env: { HOME: home, LANG: 'C.UTF-8' }
+  }).status, 1)
+
+  fs.rmSync(tmp, { recursive: true, force: true })
+})
+
+test('overlay logs through the hardened node logger, not a shell script', () => {
+  const qml = fs.readFileSync(require.resolve('../NmpOverlay.qml'), 'utf8')
+  assert.match(qml, /command: \["\/usr\/bin\/node", root\.logJs, String\(msg\)\]/)
+  assert.ok(!/log\.sh|\/usr\/bin\/bash/.test(qml))
+})

@@ -1,6 +1,6 @@
 {
   "name": "omanomorepass",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "private": true,
   "description": "Omarchy shell plugin: receive NoMorePass credentials via QR and copy them to the clipboard",
   "license": "MIT",
